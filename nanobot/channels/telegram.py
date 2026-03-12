@@ -1,4 +1,43 @@
+# =============================================================================
+# nanobot Telegram 渠道
+# 文件路径：nanobot/channels/telegram.py
+#
+# 这个文件的作用是什么？
+# -------------------------
+# 这个文件实现了 TelegramChannel 类，让 nanobot 能够通过 Telegram 与用户交互。
+#
+# 什么是 TelegramChannel？
+# --------------------
+# TelegramChannel 是 nanobot 与 Telegram 平台的"适配器"：
+# 1. 接收 Telegram 消息并转发到消息总线
+# 2. 从消息总线接收消息并发送到 Telegram
+# 3. 支持文本、图片、语音、文档等多种消息类型
+# 4. 支持群聊、话题、回复等高级功能
+#
+# 核心技术：
+# ---------
+# - python-telegram-bot v20+ (基于 asyncio)
+# - Long Polling (无需公网 IP)
+# - Markdown → Telegram HTML 转换
+# - 流式输出模拟（draft 消息）
+# - 媒体群组缓冲聚合
+#
+# 使用示例：
+# --------
+# # 配置 Telegram
+# {
+#   "channels": {
+#     "telegram": {
+#       "enabled": true,
+#       "token": "BOT_TOKEN",
+#       "allow_from": ["*"]
+#     }
+#   }
+# }
+# =============================================================================
+
 """Telegram channel implementation using python-telegram-bot."""
+# 使用 python-telegram-bot 实现 Telegram 渠道
 
 from __future__ import annotations
 
@@ -19,12 +58,29 @@ from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import TelegramConfig
 from nanobot.utils.helpers import split_message
 
-TELEGRAM_MAX_MESSAGE_LEN = 4000  # Telegram message character limit
-TELEGRAM_REPLY_CONTEXT_MAX_LEN = TELEGRAM_MAX_MESSAGE_LEN  # Max length for reply context in user message
+TELEGRAM_MAX_MESSAGE_LEN = 4000  # Telegram 消息字符上限
+TELEGRAM_REPLY_CONTEXT_MAX_LEN = TELEGRAM_MAX_MESSAGE_LEN  # 回复上下文最大长度
 
 
 def _strip_md(s: str) -> str:
-    """Strip markdown inline formatting from text."""
+    """
+    移除 markdown 内联格式。
+
+    用于处理表格渲染等场景，移除格式但保留文本内容。
+
+    支持的格式：
+    ----------
+    - **bold** → bold
+    - __bold__ → bold
+    - ~~strikethrough~~ → strikethrough
+    - `code` → code
+
+    Args:
+        s: 包含 markdown 的字符串
+
+    Returns:
+        str: 移除格式后的纯文本
+    """
     s = re.sub(r'\*\*(.+?)\*\*', r'\1', s)
     s = re.sub(r'__(.+?)__', r'\1', s)
     s = re.sub(r'~~(.+?)~~', r'\1', s)
@@ -33,9 +89,27 @@ def _strip_md(s: str) -> str:
 
 
 def _render_table_box(table_lines: list[str]) -> str:
-    """Convert markdown pipe-table to compact aligned text for <pre> display."""
+    """
+    将 markdown 管道符表格转换为紧凑对齐文本（用于<pre>显示）。
 
+    Telegram 不支持 markdown 表格，此函数将表格转换为
+    使用空格对齐的纯文本格式，适合在 <pre> 标签中显示。
+
+    Args:
+        table_lines: 表格行列表（每行如 "| 列 1 | 列 2 |"）
+
+    Returns:
+        str: 对齐后的文本表格
+
+    示例：
+        输入：["| 姓名 | 年龄 |", "|---|---|", "| 小明 | 18 |"]
+        输出：
+        姓名  年龄
+        ────  ────
+        小明  18
+    """
     def dw(s: str) -> int:
+        """计算字符串显示宽度（考虑中文字符占 2 格）"""
         return sum(2 if unicodedata.east_asian_width(c) in ('W', 'F') else 1 for c in s)
 
     rows: list[list[str]] = []
@@ -43,11 +117,11 @@ def _render_table_box(table_lines: list[str]) -> str:
     for line in table_lines:
         cells = [_strip_md(c) for c in line.strip().strip('|').split('|')]
         if all(re.match(r'^:?-+:?$', c) for c in cells if c):
-            has_sep = True
+            has_sep = True  # 分隔行
             continue
         rows.append(cells)
     if not rows or not has_sep:
-        return '\n'.join(table_lines)
+        return '\n'.join(table_lines)  # 不是有效表格，返回原文本
 
     ncols = max(len(r) for r in rows)
     for r in rows:
@@ -55,23 +129,56 @@ def _render_table_box(table_lines: list[str]) -> str:
     widths = [max(dw(r[c]) for r in rows) for c in range(ncols)]
 
     def dr(cells: list[str]) -> str:
+        """渲染一行：每个单元格右填充到列宽"""
         return '  '.join(f'{c}{" " * (w - dw(c))}' for c, w in zip(cells, widths))
 
-    out = [dr(rows[0])]
-    out.append('  '.join('─' * w for w in widths))
+    out = [dr(rows[0])]  # 表头
+    out.append('  '.join('─' * w for w in widths))  # 分隔线
     for row in rows[1:]:
-        out.append(dr(row))
+        out.append(dr(row))  # 数据行
     return '\n'.join(out)
 
 
 def _markdown_to_telegram_html(text: str) -> str:
     """
-    Convert markdown to Telegram-safe HTML.
+    将 Markdown 转换为 Telegram 安全的 HTML。
+
+    Telegram 支持有限的 HTML 标签：<b>, <i>, <u>, <s>, <code>, <pre>, <a>
+    此函数将 Markdown 语法转换为对应的 HTML。
+
+    转换规则：
+    --------
+    1. 代码块：```code``` → <pre><code>code</code></pre>
+    2. 表格：| 列 | → 盒式绘图（通过_render_table_box）
+    3. 内联代码：`code` → <code>code</code>
+    4. 标题：# Title → Title
+    5. 块引用：> text → text
+    6. 链接：[text](url) → <a href="url">text</a>
+    7. 粗体：**text** 或 __text__ → <b>text</b>
+    8. 斜体：_text_ → <i>text</i>
+    9. 删除线：~~text~~ → <s>text</s>
+    10. 列表：- item → • item
+
+    处理流程：
+    --------
+    1. 提取并保护代码块（避免其他处理影响）
+    2. 转换表格为盒式绘图
+    3. 提取并保护内联代码
+    4. 处理标题、块引用
+    5. 转义 HTML 特殊字符
+    6. 处理链接、粗体、斜体、删除线
+    7. 恢复内联代码和代码块
+
+    Args:
+        text: Markdown 格式文本
+
+    Returns:
+        str: Telegram HTML 格式文本
     """
     if not text:
         return ""
 
-    # 1. Extract and protect code blocks (preserve content from other processing)
+    # 1. 提取并保护代码块（保留内容不受其他处理影响）
     code_blocks: list[str] = []
     def save_code_block(m: re.Match) -> str:
         code_blocks.append(m.group(1))
@@ -79,7 +186,7 @@ def _markdown_to_telegram_html(text: str) -> str:
 
     text = re.sub(r'```[\w]*\n?([\s\S]*?)```', save_code_block, text)
 
-    # 1.5. Convert markdown tables to box-drawing (reuse code_block placeholders)
+    # 1.5. 将 markdown 表格转换为盒式绘图（复用 code_block 占位符）
     lines = text.split('\n')
     rebuilt: list[str] = []
     li = 0
@@ -100,7 +207,7 @@ def _markdown_to_telegram_html(text: str) -> str:
             li += 1
     text = '\n'.join(rebuilt)
 
-    # 2. Extract and protect inline code
+    # 2. 提取并保护内联代码
     inline_codes: list[str] = []
     def save_inline_code(m: re.Match) -> str:
         inline_codes.append(m.group(1))
@@ -108,40 +215,40 @@ def _markdown_to_telegram_html(text: str) -> str:
 
     text = re.sub(r'`([^`]+)`', save_inline_code, text)
 
-    # 3. Headers # Title -> just the title text
+    # 3. 标题 # Title → 仅保留标题文本
     text = re.sub(r'^#{1,6}\s+(.+)$', r'\1', text, flags=re.MULTILINE)
 
-    # 4. Blockquotes > text -> just the text (before HTML escaping)
+    # 4. 块引用 > text → 仅保留文本（在 HTML 转义之前）
     text = re.sub(r'^>\s*(.*)$', r'\1', text, flags=re.MULTILINE)
 
-    # 5. Escape HTML special characters
+    # 5. 转义 HTML 特殊字符
     text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-    # 6. Links [text](url) - must be before bold/italic to handle nested cases
+    # 6. 链接 [text](url) → 必须在粗体/斜体之前处理，避免嵌套问题
     text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', text)
 
-    # 7. Bold **text** or __text__
+    # 7. 粗体 **text** 或 __text__
     text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
     text = re.sub(r'__(.+?)__', r'<b>\1</b>', text)
 
-    # 8. Italic _text_ (avoid matching inside words like some_var_name)
+    # 8. 斜体 _text_（避免匹配变量名如 some_var_name）
     text = re.sub(r'(?<![a-zA-Z0-9])_([^_]+)_(?![a-zA-Z0-9])', r'<i>\1</i>', text)
 
-    # 9. Strikethrough ~~text~~
+    # 9. 删除线 ~~text~~
     text = re.sub(r'~~(.+?)~~', r'<s>\1</s>', text)
 
-    # 10. Bullet lists - item -> • item
+    # 10. 列表 - item → • item
     text = re.sub(r'^[-*]\s+', '• ', text, flags=re.MULTILINE)
 
-    # 11. Restore inline code with HTML tags
+    # 11. 恢复内联代码（带 HTML 标签）
     for i, code in enumerate(inline_codes):
-        # Escape HTML in code content
+        # 转义 HTML 字符
         escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
         text = text.replace(f"\x00IC{i}\x00", f"<code>{escaped}</code>")
 
-    # 12. Restore code blocks with HTML tags
+    # 12. 恢复代码块（带 HTML 标签）
     for i, code in enumerate(code_blocks):
-        # Escape HTML in code content
+        # 转义 HTML 字符
         escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
         text = text.replace(f"\x00CB{i}\x00", f"<pre><code>{escaped}</code></pre>")
 
@@ -150,15 +257,61 @@ def _markdown_to_telegram_html(text: str) -> str:
 
 class TelegramChannel(BaseChannel):
     """
-    Telegram channel using long polling.
+    使用长轮询的 Telegram 渠道实现。
 
-    Simple and reliable - no webhook/public IP needed.
+    核心特性：
+    --------
+    1. 长轮询模式：无需公网 IP，简单可靠
+    2. 多媒体支持：文本、图片、语音、文档、视频
+    3. Markdown 转换：自动将 Markdown 转为 Telegram HTML
+    4. 流式模拟：使用 draft 消息模拟打字机效果
+    5. 媒体群组：缓冲聚合媒体群组消息
+    6. 话题支持：支持 Telegram Forum 话题
+    7. 回复上下文：提取回复消息内容作为上下文
+
+    属性说明：
+    --------
+    name: str
+        渠道名称："telegram"
+
+    display_name: str
+        显示名称："Telegram"
+
+    BOT_COMMANDS: list[BotCommand]
+        机器人命令菜单
+
+    _app: Application | None
+        python-telegram-bot 应用实例
+
+    _chat_ids: dict[str, int]
+        发送者 ID 到聊天 ID 的映射（用于回复）
+
+    _typing_tasks: dict[str, asyncio.Task]
+        正在输入的打字指示任务
+
+    _media_group_buffers: dict[str, dict]
+        媒体群组缓冲（聚合同一群组的消息）
+
+    _message_threads: dict[tuple[str, int], int]
+        话题线程 ID 缓存（用于回复）
+
+    _bot_user_id: int | None
+        机器人用户 ID（用于提及检测）
+
+    _bot_username: str | None
+        机器人用户名（用于提及检测）
+
+    使用示例：
+    --------
+    >>> config = TelegramConfig(token="BOT_TOKEN", allow_from=["*"])
+    >>> channel = TelegramChannel(config, message_bus)
+    >>> await channel.start()  # 启动轮询
     """
 
     name = "telegram"
     display_name = "Telegram"
 
-    # Commands registered with Telegram's command menu
+    # 注册到 Telegram 命令菜单的机器人命令
     BOT_COMMANDS = [
         BotCommand("start", "Start the bot"),
         BotCommand("new", "Start a new conversation"),
@@ -168,19 +321,44 @@ class TelegramChannel(BaseChannel):
     ]
 
     def __init__(self, config: TelegramConfig, bus: MessageBus):
+        """
+        初始化 Telegram 渠道。
+
+        Args:
+            config: Telegram 配置对象（包含 token、allow_from 等）
+            bus: 消息总线实例
+        """
         super().__init__(config, bus)
-        self.config: TelegramConfig = config
-        self._app: Application | None = None
-        self._chat_ids: dict[str, int] = {}  # Map sender_id to chat_id for replies
-        self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
-        self._media_group_buffers: dict[str, dict] = {}
-        self._media_group_tasks: dict[str, asyncio.Task] = {}
-        self._message_threads: dict[tuple[str, int], int] = {}
-        self._bot_user_id: int | None = None
-        self._bot_username: str | None = None
+        self.config: TelegramConfig = config  # Telegram 配置
+        self._app: Application | None = None  # python-telegram-bot 应用
+        self._chat_ids: dict[str, int] = {}  # 发送者 ID → 聊天 ID 映射
+        self._typing_tasks: dict[str, asyncio.Task] = {}  # 打字指示任务
+        self._media_group_buffers: dict[str, dict] = {}  # 媒体群组缓冲
+        self._media_group_tasks: dict[str, asyncio.Task] = {}  # 媒体群组任务
+        self._message_threads: dict[tuple[str, int], int] = {}  # 话题线程缓存
+        self._bot_user_id: int | None = None  # 机器人用户 ID
+        self._bot_username: str | None = None  # 机器人用户名
 
     def is_allowed(self, sender_id: str) -> bool:
-        """Preserve Telegram's legacy id|username allowlist matching."""
+        """
+        检查发送者是否被允许（保留 Telegram 传统 id|username 匹配）。
+
+        Telegram 的 allow_from 配置支持三种匹配方式：
+        1. 用户 ID：如 "123456"
+        2. 用户名：如 "username"
+        3. 组合：如 "123456|username"（内部格式）
+
+        Args:
+            sender_id: 发送者 ID（格式："id" 或 "id|username"）
+
+        Returns:
+            bool: True 表示允许访问
+
+        匹配逻辑：
+        --------
+        1. 先调用父类的 is_allowed() 检查基本规则
+        2. 如果是 "id|username" 格式，分别检查 id 和 username
+        """
         if super().is_allowed(sender_id):
             return True
 
@@ -199,14 +377,37 @@ class TelegramChannel(BaseChannel):
         return sid in allow_list or username in allow_list
 
     async def start(self) -> None:
-        """Start the Telegram bot with long polling."""
+        """
+        启动 Telegram 机器人（长轮询模式）。
+
+        启动流程：
+        --------
+        1. 检查 bot token 是否配置
+        2. 创建 HTTPXRequest（增大连接池避免超时）
+        3. 构建 Application 实例
+        4. 注册命令处理器（/start, /new, /stop, /help, /restart）
+        5. 注册消息处理器（文本、图片、语音、文档）
+        6. 初始化应用并获取机器人信息
+        7. 注册命令菜单
+        8. 启动轮询（长期运行直到被停止）
+
+        连接池配置：
+        ---------
+        - connection_pool_size: 16（默认更小）
+        - pool_timeout: 5.0 秒
+        - connect/read_timeout: 30.0 秒
+
+        注意：
+        ----
+        这是一个长期运行的方法，会持续轮询直到 stop() 被调用。
+        """
         if not self.config.token:
             logger.error("Telegram bot token not configured")
             return
 
         self._running = True
 
-        # Build the application with larger connection pool to avoid pool-timeout on long runs
+        # 构建应用（使用更大的连接池避免长时间运行时超时）
         req = HTTPXRequest(
             connection_pool_size=16,
             pool_timeout=5.0,
@@ -218,14 +419,14 @@ class TelegramChannel(BaseChannel):
         self._app = builder.build()
         self._app.add_error_handler(self._on_error)
 
-        # Add command handlers
+        # 添加命令处理器
         self._app.add_handler(CommandHandler("start", self._on_start))
         self._app.add_handler(CommandHandler("new", self._forward_command))
         self._app.add_handler(CommandHandler("stop", self._forward_command))
         self._app.add_handler(CommandHandler("restart", self._forward_command))
         self._app.add_handler(CommandHandler("help", self._on_help))
 
-        # Add message handler for text, photos, voice, documents
+        # 添加消息处理器（文本、图片、语音、文档）
         self._app.add_handler(
             MessageHandler(
                 (filters.TEXT | filters.PHOTO | filters.VOICE | filters.AUDIO | filters.Document.ALL)
@@ -236,11 +437,11 @@ class TelegramChannel(BaseChannel):
 
         logger.info("Starting Telegram bot (polling mode)...")
 
-        # Initialize and start polling
+        # 初始化并启动轮询
         await self._app.initialize()
         await self._app.start()
 
-        # Get bot info and register command menu
+        # 获取机器人信息并注册命令菜单
         bot_info = await self._app.bot.get_me()
         self._bot_user_id = getattr(bot_info, "id", None)
         self._bot_username = getattr(bot_info, "username", None)
@@ -252,24 +453,35 @@ class TelegramChannel(BaseChannel):
         except Exception as e:
             logger.warning("Failed to register bot commands: {}", e)
 
-        # Start polling (this runs until stopped)
+        # 开始轮询（持续运行直到被停止）
         await self._app.updater.start_polling(
             allowed_updates=["message"],
-            drop_pending_updates=True  # Ignore old messages on startup
+            drop_pending_updates=True  # 启动时忽略旧消息
         )
 
-        # Keep running until stopped
+        # 保持运行直到被停止
         while self._running:
             await asyncio.sleep(1)
 
     async def stop(self) -> None:
-        """Stop the Telegram bot."""
+        """
+        停止 Telegram 机器人。
+
+        停止流程：
+        --------
+        1. 设置运行标志为 False
+        2. 取消所有打字指示任务
+        3. 取消媒体群组任务并清空缓冲
+        4. 停止 updater 和应用
+        5. 关闭连接
+        """
         self._running = False
 
-        # Cancel all typing indicators
+        # 取消所有打字指示
         for chat_id in list(self._typing_tasks):
             self._stop_typing(chat_id)
 
+        # 取消媒体群组任务
         for task in self._media_group_tasks.values():
             task.cancel()
         self._media_group_tasks.clear()
@@ -284,7 +496,22 @@ class TelegramChannel(BaseChannel):
 
     @staticmethod
     def _get_media_type(path: str) -> str:
-        """Guess media type from file extension."""
+        """
+        根据文件扩展名猜测媒体类型。
+
+        Args:
+            path: 文件路径
+
+        Returns:
+            str: 媒体类型（"photo"、"voice"、"audio" 或 "document"）
+
+        扩展名映射：
+        ---------
+        - jpg, jpeg, png, gif, webp → photo
+        - ogg → voice
+        - mp3, m4a, wav, aac → audio
+        - 其他 → document
+        """
         ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
         if ext in ("jpg", "jpeg", "png", "gif", "webp"):
             return "photo"
@@ -295,12 +522,37 @@ class TelegramChannel(BaseChannel):
         return "document"
 
     async def send(self, msg: OutboundMessage) -> None:
-        """Send a message through Telegram."""
+        """
+        通过 Telegram 发送消息。
+
+        发送流程：
+        --------
+        1. 检查机器人是否运行
+        2. 停止打字指示（仅最终响应）
+        3. 解析 chat_id
+        4. 获取回复消息 ID 和话题线程 ID
+        5. 发送媒体文件（如果有）
+        6. 发送文本内容（分片处理超长消息）
+
+        媒体类型支持：
+        -----------
+        - photo: jpg, jpeg, png, gif, webp
+        - voice: ogg
+        - audio: mp3, m4a, wav, aac
+        - document: 其他文件
+
+        消息分片：
+        --------
+        Telegram 消息限制 4000 字符，超长消息会被 split_message() 分割。
+
+        Args:
+            msg: 出站消息对象（包含 channel, chat_id, content, media 等）
+        """
         if not self._app:
             logger.warning("Telegram bot not running")
             return
 
-        # Only stop typing indicator for final responses
+        # 仅最终响应停止打字指示
         if not msg.metadata.get("_progress", False):
             self._stop_typing(msg.chat_id)
 
@@ -325,7 +577,7 @@ class TelegramChannel(BaseChannel):
                     allow_sending_without_reply=True
                 )
 
-        # Send media files
+        # 发送媒体文件
         for media_path in (msg.media or []):
             try:
                 media_type = self._get_media_type(media_path)
@@ -352,12 +604,12 @@ class TelegramChannel(BaseChannel):
                     **thread_kwargs,
                 )
 
-        # Send text content
+        # 发送文本内容
         if msg.content and msg.content != "[empty message]":
             is_progress = msg.metadata.get("_progress", False)
 
             for chunk in split_message(msg.content, TELEGRAM_MAX_MESSAGE_LEN):
-                # Final response: simulate streaming via draft, then persist
+                # 最终响应：模拟流式输出（draft → persist）
                 if not is_progress:
                     await self._send_with_streaming(chat_id, chunk, reply_params, thread_kwargs)
                 else:
@@ -370,7 +622,21 @@ class TelegramChannel(BaseChannel):
         reply_params=None,
         thread_kwargs: dict | None = None,
     ) -> None:
-        """Send a plain text message with HTML fallback."""
+        """
+        发送纯文本消息（HTML 失败时回退到纯文本）。
+
+        Args:
+            chat_id: 聊天 ID
+            text: 要发送的文本
+            reply_params: 回复参数（可选）
+            thread_kwargs: 话题线程参数（可选）
+
+        处理流程：
+        --------
+        1. 将 Markdown 转换为 Telegram HTML
+        2. 尝试发送 HTML 格式消息
+        3. 如果失败，回退到纯文本发送
+        """
         try:
             html = _markdown_to_telegram_html(text)
             await self._app.bot.send_message(
@@ -397,7 +663,25 @@ class TelegramChannel(BaseChannel):
         reply_params=None,
         thread_kwargs: dict | None = None,
     ) -> None:
-        """Simulate streaming via send_message_draft, then persist with send_message."""
+        """
+        通过 draft 消息模拟流式输出，然后发送完整消息。
+
+        Telegram 不支持真正的流式输出，此方法使用 draft 消息
+        模拟打字机效果，让用户感觉消息正在"流式"显示。
+
+        Args:
+            chat_id: 聊天 ID
+            text: 要发送的文本
+            reply_params: 回复参数（可选）
+            thread_kwargs: 话题线程参数（可选）
+
+        流式模拟流程：
+        -----------
+        1. 生成 draft_id（基于时间戳）
+        2. 分 8 个步骤发送 draft 消息（每步显示更多内容）
+        3. 每次 draft 间隔 40ms
+        4. 最后发送完整消息（持久化）
+        """
         draft_id = int(time.time() * 1000) % (2**31)
         try:
             step = max(len(text) // 8, 40)
