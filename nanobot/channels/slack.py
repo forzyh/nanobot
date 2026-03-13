@@ -171,7 +171,17 @@ class SlackChannel(BaseChannel):
             await asyncio.sleep(1)
 
     async def stop(self) -> None:
-        """停止 Slack 客户端，关闭 Socket Mode 连接。"""
+        """
+        停止 Slack 客户端，关闭 Socket Mode 连接。
+
+        停止流程：
+        1. 设置运行标志为 False，停止主循环
+        2. 关闭 SocketModeClient 连接
+        3. 清理客户端引用
+
+        异常处理：
+        - 关闭失败：记录警告日志，不影响清理完成
+        """
         self._running = False
         if self._socket_client:
             try:
