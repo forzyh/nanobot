@@ -1,4 +1,71 @@
+# =============================================================================
+# nanobot 邮件渠道
+# 文件路径：nanobot/channels/email.py
+#
+# 这个文件的作用是什么？
+# -------------------------
+# 这个文件实现了 EmailChannel 类，让 nanobot 能够通过电子邮件与用户交互。
+#
+# 什么是 EmailChannel？
+# ------------------
+# EmailChannel 是 nanobot 与电子邮件系统的"适配器"：
+# 1. 通过 IMAP 协议定期收取未读邮件
+# 2. 将邮件内容转换为 nanobot 内部消息格式
+# 3. 通过 SMTP 协议回复邮件
+#
+# 为什么需要邮件渠道？
+# ------------------
+# 1. 正式沟通：邮件是正式商务沟通的主要方式
+# 2. 长内容支持：邮件支持长文本和附件
+# 3. 历史记录：邮件天然有完整的存档
+# 4. 无需安装：用户不需要安装额外的应用
+#
+# 工作原理：
+# ---------
+# 入站（接收邮件）：
+# 1. 定期（如每 30 秒）连接 IMAP 服务器
+# 2. 查询未读邮件（UNSEEN）
+# 3. 解析邮件内容（发件人、主题、正文）
+# 4. 转换为 InboundMessage 发布到消息总线
+# 5. 标记邮件为已读（可选）
+#
+# 出站（回复邮件）：
+# 1. 从消息总线获取 OutboundMessage
+# 2. 构建回复邮件（主题、收件人、正文）
+# 3. 通过 SMTP 服务器发送
+# 4. 如果是回复，添加 In-Reply-To 头保持对话连贯
+#
+# 配置示例：
+# --------
+# {
+#   "channels": {
+#     "email": {
+#       "enabled": true,
+#       "consentGranted": true,
+#       "imapHost": "imap.gmail.com",
+#       "imapPort": 993,
+#       "imapUsername": "user@gmail.com",
+#       "imapPassword": "app-password",
+#       "smtpHost": "smtp.gmail.com",
+#       "smtpPort": 587,
+#       "smtpUsername": "user@gmail.com",
+#       "smtpPassword": "app-password",
+#       "pollIntervalSeconds": 30,
+#       "markSeen": true,
+#       "autoReplyEnabled": true
+#     }
+#   }
+# }
+#
+# 安全注意事项：
+# ------------
+# 1. consentGranted: 必须用户明确同意后才能启用
+# 2. 使用应用专用密码，不要使用主密码
+# 3. 建议启用 SSL/TLS 加密连接
+# =============================================================================
+
 """Email channel implementation using IMAP polling + SMTP replies."""
+# 邮件渠道：使用 IMAP 轮询接收 + SMTP 回复
 
 import asyncio
 import html

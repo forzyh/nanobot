@@ -1,4 +1,57 @@
+# =============================================================================
+# nanobot OpenAI Codex 提供商
+# 文件路径：nanobot/providers/openai_codex_provider.py
+#
+# 这个文件的作用是什么？
+# -------------------------
+# 实现了 OpenAICodexProvider 类，用于通过 OAuth 连接 ChatGPT Codex API。
+#
+# 什么是 OpenAI Codex Provider？
+# ---------------------------
+# OpenAICodexProvider 是 ChatGPT Codex Responses API 的专用适配器：
+# 1. 使用 OAuth 2.0 认证（通过 oauth_cli_kit）
+# 2. 直接调用 Codex Responses API（非标准 OpenAI API）
+# 3. 处理 SSE（Server-Sent Events）流式响应
+#
+# 为什么需要 OpenAI Codex Provider？
+# --------------------------------
+# 1. 访问最新模型：Codex 是 OpenAI 最新的代码专用模型
+# 2. 增强功能：支持更复杂的代码理解和生成任务
+# 3. ChatGPT 集成：通过 ChatGPT 后端访问，无需独立 API 密钥
+#
+# 工作原理：
+# ---------
+# 1. 使用 oauth_cli_kit 获取 OAuth token
+# 2. 构建 Codex Responses API 请求（特殊格式）
+# 3. 发送 HTTP POST 请求到 chatgpt.com/backend-api/codex/responses
+# 4. 解析 SSE 流式响应
+# 5. 将事件转换为标准 LLMResponse 格式
+#
+# Codex API 与标准 OpenAI API 的区别：
+# ----------------------------------
+# 1. 认证方式：OAuth 2.0（而非 API Key）
+# 2. 请求格式：使用 "input" 数组而非 "messages"
+# 3. 响应格式：SSE 流式，事件类型多样
+# 4. 功能支持：支持 reasoning.encrypted_content
+#
+# 配置示例：
+# --------
+# {
+#   "provider": {
+#     "type": "openai-codex",
+#     "defaultModel": "openai-codex/gpt-5.1-codex"
+#   }
+# }
+#
+# 注意事项：
+# --------
+# 1. 需要用户先通过 ChatGPT 网页登录
+# 2. oauth_cli_kit 会读取本地缓存的 token
+# 3. 如果 SSL 证书验证失败，会自动重试（verify=False）
+# =============================================================================
+
 """OpenAI Codex Responses Provider."""
+# OpenAI Codex Responses 提供商：通过 OAuth 访问 ChatGPT Codex API
 
 from __future__ import annotations
 
@@ -13,14 +66,31 @@ from oauth_cli_kit import get_token as get_codex_token
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
+# Codex API 默认端点
 DEFAULT_CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
+# 请求来源标识
 DEFAULT_ORIGINATOR = "nanobot"
 
 
 class OpenAICodexProvider(LLMProvider):
-    """Use Codex OAuth to call the Responses API."""
+    """
+    使用 Codex OAuth 调用 Responses API。
+
+    特点：
+    - 通过 oauth_cli_kit 获取 ChatGPT OAuth token
+    - 直接调用 Codex Responses API（非标准 OpenAI API 格式）
+    - 支持流式 SSE 响应解析
+    - 支持 reasoning.encrypted_content（推理内容加密）
+    - 自动处理 SSL 证书验证失败的情况
+    """
 
     def __init__(self, default_model: str = "openai-codex/gpt-5.1-codex"):
+        """
+        初始化 OpenAI Codex 提供商。
+
+        Args:
+            default_model: 默认模型名称（如 "gpt-5.1-codex"）
+        """
         super().__init__(api_key=None, api_base=None)
         self.default_model = default_model
 
@@ -34,6 +104,21 @@ class OpenAICodexProvider(LLMProvider):
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
     ) -> LLMResponse:
+        """
+        发送聊天完成请求到 Codex Responses API。
+
+        Args:
+            messages: 消息列表，每个消息包含 'role' 和 'content'
+            tools: 工具定义列表（可选）
+            model: 模型标识符（覆盖默认模型）
+            max_tokens: 响应最大 token 数
+            temperature: 采样温度
+            reasoning_effort: 推理努力程度（可选）
+            tool_choice: 工具选择策略
+
+        Returns:
+            LLMResponse 对象，包含回复内容和/或工具调用
+        """
         model = model or self.default_model
         system_prompt, input_items = _convert_messages(messages)
 
@@ -81,16 +166,36 @@ class OpenAICodexProvider(LLMProvider):
             )
 
     def get_default_model(self) -> str:
+        """获取默认模型名称。"""
         return self.default_model
 
 
 def _strip_model_prefix(model: str) -> str:
+    """
+    移除模型名称的前缀。
+
+    Args:
+        model: 原始模型名称（如 "openai-codex/gpt-5.1-codex"）
+
+    Returns:
+        去除前缀后的模型名称（如 "gpt-5.1-codex"）
+    """
     if model.startswith("openai-codex/") or model.startswith("openai_codex/"):
         return model.split("/", 1)[1]
     return model
 
 
 def _build_headers(account_id: str, token: str) -> dict[str, str]:
+    """
+    构建 Codex API 请求头。
+
+    Args:
+        account_id: ChatGPT 账户 ID
+        token: OAuth access token
+
+    Returns:
+        包含认证和格式信息的请求头字典
+    """
     return {
         "Authorization": f"Bearer {token}",
         "chatgpt-account-id": account_id,
@@ -108,6 +213,18 @@ async def _request_codex(
     body: dict[str, Any],
     verify: bool,
 ) -> tuple[str, list[ToolCallRequest], str]:
+    """
+    向 Codex API 发送 HTTP 请求并解析 SSE 响应。
+
+    Args:
+        url: API 端点 URL
+        headers: 请求头
+        body: 请求体
+        verify: 是否验证 SSL 证书
+
+    Returns:
+        三元组：(文本内容，工具调用列表，结束原因)
+    """
     async with httpx.AsyncClient(timeout=60.0, verify=verify) as client:
         async with client.stream("POST", url, headers=headers, json=body) as response:
             if response.status_code != 200:
@@ -117,7 +234,17 @@ async def _request_codex(
 
 
 def _convert_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Convert OpenAI function-calling schema to Codex flat format."""
+    """
+    将 OpenAI 函数调用模式转换为 Codex 扁平格式。
+
+    Codex 的工具格式与标准 OpenAI 格式略有不同，此函数负责转换。
+
+    Args:
+        tools: OpenAI 格式的工具定义列表
+
+    Returns:
+        Codex 格式的工具定义列表
+    """
     converted: list[dict[str, Any]] = []
     for tool in tools:
         fn = (tool.get("function") or {}) if tool.get("type") == "function" else tool
@@ -135,6 +262,21 @@ def _convert_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _convert_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
+    """
+    将标准消息格式转换为 Codex input_items 格式。
+
+    Codex Responses API 使用不同的消息格式：
+    - system 消息转换为 instructions
+    - user 消息转换为 input 数组项
+    - assistant 消息转换为已完成的消息或工具调用
+    - tool 消息转换为 function_call_output
+
+    Args:
+        messages: 标准消息列表（包含 role 和 content）
+
+    Returns:
+        二元组：(系统提示，input_items 列表)
+    """
     system_prompt = ""
     input_items: list[dict[str, Any]] = []
 
@@ -151,7 +293,7 @@ def _convert_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[st
             continue
 
         if role == "assistant":
-            # Handle text first.
+            # 首先处理文本内容
             if isinstance(content, str) and content:
                 input_items.append(
                     {
@@ -162,7 +304,7 @@ def _convert_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[st
                         "id": f"msg_{idx}",
                     }
                 )
-            # Then handle tool calls.
+            # 然后处理工具调用
             for tool_call in msg.get("tool_calls", []) or []:
                 fn = tool_call.get("function") or {}
                 call_id, item_id = _split_tool_call_id(tool_call.get("id"))
@@ -195,6 +337,19 @@ def _convert_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[st
 
 
 def _convert_user_message(content: Any) -> dict[str, Any]:
+    """
+    转换用户消息为 Codex 格式。
+
+    支持文本和图片内容：
+    - 文本转换为 input_text
+    - 图片转换为 input_image
+
+    Args:
+        content: 用户消息内容（字符串或内容数组）
+
+    Returns:
+        Codex 格式的用户消息字典
+    """
     if isinstance(content, str):
         return {"role": "user", "content": [{"type": "input_text", "text": content}]}
     if isinstance(content, list):
@@ -214,6 +369,17 @@ def _convert_user_message(content: Any) -> dict[str, Any]:
 
 
 def _split_tool_call_id(tool_call_id: Any) -> tuple[str, str | None]:
+    """
+    分割工具调用 ID。
+
+    Codex 工具调用 ID 可能包含 call_id 和 item_id，用 | 分隔。
+
+    Args:
+        tool_call_id: 原始工具调用 ID
+
+    Returns:
+        二元组：(call_id, item_id 或 None)
+    """
     if isinstance(tool_call_id, str) and tool_call_id:
         if "|" in tool_call_id:
             call_id, item_id = tool_call_id.split("|", 1)
@@ -223,11 +389,34 @@ def _split_tool_call_id(tool_call_id: Any) -> tuple[str, str | None]:
 
 
 def _prompt_cache_key(messages: list[dict[str, Any]]) -> str:
+    """
+    为消息列表生成提示缓存键。
+
+    使用 SHA256 哈希值作为缓存键，用于提示缓存优化。
+
+    Args:
+        messages: 消息列表
+
+    Returns:
+        SHA256 哈希值（十六进制字符串）
+    """
     raw = json.dumps(messages, ensure_ascii=True, sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 async def _iter_sse(response: httpx.Response) -> AsyncGenerator[dict[str, Any], None]:
+    """
+    迭代 SSE（Server-Sent Events）响应流。
+
+    SSE 格式：
+    data: {"type": "event_type", ...}
+
+    Args:
+        response: HTTP 响应对象
+
+    Yields:
+        解析后的事件字典
+    """
     buffer: list[str] = []
     async for line in response.aiter_lines():
         if line == "":
@@ -248,6 +437,23 @@ async def _iter_sse(response: httpx.Response) -> AsyncGenerator[dict[str, Any], 
 
 
 async def _consume_sse(response: httpx.Response) -> tuple[str, list[ToolCallRequest], str]:
+    """
+    消费 SSE 流并提取完整响应。
+
+    处理的事件类型：
+    - response.output_item.added: 添加输出项（文本或工具调用）
+    - response.output_text.delta: 文本增量
+    - response.function_call_arguments.delta: 工具调用参数增量
+    - response.function_call_arguments.done: 工具调用参数完成
+    - response.output_item.done: 输出项完成
+    - response.completed: 响应完成
+
+    Args:
+        response: HTTP 响应对象
+
+    Returns:
+        三元组：(文本内容，工具调用列表，结束原因)
+    """
     content = ""
     tool_calls: list[ToolCallRequest] = []
     tool_call_buffers: dict[str, dict[str, Any]] = {}
@@ -304,14 +510,34 @@ async def _consume_sse(response: httpx.Response) -> tuple[str, list[ToolCallRequ
     return content, tool_calls, finish_reason
 
 
+# 结束原因映射表：将 Codex 状态映射为标准 finish_reason
 _FINISH_REASON_MAP = {"completed": "stop", "incomplete": "length", "failed": "error", "cancelled": "error"}
 
 
 def _map_finish_reason(status: str | None) -> str:
+    """
+    将 Codex 响应状态映射为标准结束原因。
+
+    Args:
+        status: Codex 响应状态（如 "completed"、"incomplete"）
+
+    Returns:
+        标准结束原因（stop、length、error 等）
+    """
     return _FINISH_REASON_MAP.get(status or "completed", "stop")
 
 
 def _friendly_error(status_code: int, raw: str) -> str:
+    """
+    生成友好的错误消息。
+
+    Args:
+        status_code: HTTP 状态码
+        raw: 原始响应文本
+
+    Returns:
+        友好的错误描述字符串
+    """
     if status_code == 429:
         return "ChatGPT usage quota exceeded or rate limit triggered. Please try again later."
     return f"HTTP {status_code}: {raw}"

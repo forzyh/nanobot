@@ -1,4 +1,66 @@
+# =============================================================================
+# nanobot QQ 渠道
+# 文件路径：nanobot/channels/qq.py
+#
+# 这个文件的作用是什么？
+# -------------------------
+# 这个文件实现了 QQChannel 类，让 nanobot 能够通过 QQ 与用户交互。
+#
+# 什么是 QQChannel？
+# ------------------
+# QQChannel 是 nanobot 与 QQ 平台的"适配器"：
+# 1. 使用 botpy SDK 连接 QQ 开放平台
+# 2. 支持 C2C（单聊）和 Group（群聊）消息
+# 3. 通过 WebSocket 长连接接收消息
+# 4. 通过 HTTP API 发送消息
+#
+# 为什么需要 QQ 渠道？
+# ------------------
+# 1. 年轻用户群体：QQ 在中国年轻用户中广泛使用
+# 2. 群聊功能：支持 QQ 群机器人
+# 3. 多媒体支持：支持文本、图片、表情等
+# 4. 官方 SDK：使用腾讯官方 botpy SDK，稳定可靠
+#
+# 工作原理：
+# ---------
+# 入站（接收消息）：
+# 1. 通过 botpy.Client 建立 WebSocket 连接
+# 2. 监听 on_c2c_message_create（单聊消息）
+# 3. 监听 on_group_at_message_create（群聊@消息）
+# 4. 监听 on_direct_message_create（频道私信）
+# 5. 将消息转换为 InboundMessage 发布到消息总线
+#
+# 出站（发送消息）：
+# 1. 从消息总线获取 OutboundMessage
+# 2. 根据聊天类型调用 post_c2c_message 或 post_group_message
+# 3. 使用 msg_seq 避免被 QQ API 去重
+# 4. 支持 Markdown 格式消息
+#
+# 配置示例：
+# --------
+# {
+#   "channels": {
+#     "qq": {
+#       "enabled": true,
+#       "appId": "your-app-id",
+#       "secret": "your-app-secret"
+#     }
+#   }
+# }
+#
+# 依赖安装：
+# --------
+# pip install qq-botpy
+#
+# 注意事项：
+# --------
+# 1. 需要在 QQ 开放平台创建机器人应用
+# 2. 需要配置正确的回调地址和权限
+# 3. 群聊需要机器人被添加到群并授予权限
+# =============================================================================
+
 """QQ channel implementation using botpy SDK."""
+# QQ 渠道：使用 botpy SDK 实现 QQ 机器人功能
 
 import asyncio
 from collections import deque
@@ -27,12 +89,23 @@ if TYPE_CHECKING:
 
 
 def _make_bot_class(channel: "QQChannel") -> "type[botpy.Client]":
-    """Create a botpy Client subclass bound to the given channel."""
+    """
+    创建绑定到指定渠道的 botpy Client 子类。
+
+    此函数动态创建一个 Bot 类，继承自 botpy.Client，
+    并重写事件处理方法以调用 QQChannel 的内部方法。
+
+    Args:
+        channel: QQChannel 实例
+
+    Returns:
+        动态创建的 Bot 类
+    """
     intents = botpy.Intents(public_messages=True, direct_message=True)
 
     class _Bot(botpy.Client):
         def __init__(self):
-            # Disable botpy's file log — nanobot uses loguru; default "botpy.log" fails on read-only fs
+            # 禁用 botpy 的文件日志 — nanobot 使用 loguru；默认 "botpy.log" 在只读文件系统上会失败
             super().__init__(intents=intents, ext_handlers=False)
 
         async def on_ready(self):
@@ -51,12 +124,32 @@ def _make_bot_class(channel: "QQChannel") -> "type[botpy.Client]":
 
 
 class QQChannel(BaseChannel):
-    """QQ channel using botpy SDK with WebSocket connection."""
+    """
+    使用 botpy SDK 和 WebSocket 连接的 QQ 渠道。
+
+    支持的消息类型：
+    - C2C 消息（单聊）
+    - 群聊消息（需要@机器人）
+    - 频道私信
+
+    特点：
+    - WebSocket 长连接接收消息
+    - 自动重连机制
+    - 消息去重（基于 message ID）
+    - 支持 Markdown 格式发送消息
+    """
 
     name = "qq"
     display_name = "QQ"
 
     def __init__(self, config: QQConfig, bus: MessageBus):
+        """
+        初始化 QQ 渠道。
+
+        Args:
+            config: QQ 配置对象（包含 app_id 和 secret）
+            bus: 消息总线实例
+        """
         super().__init__(config, bus)
         self.config: QQConfig = config
         self._client: "botpy.Client | None" = None
@@ -65,7 +158,12 @@ class QQChannel(BaseChannel):
         self._chat_type_cache: dict[str, str] = {}
 
     async def start(self) -> None:
-        """Start the QQ bot."""
+        """
+        启动 QQ 机器人。
+
+        检查 SDK 可用性和配置完整性，然后启动 botpy 客户端。
+        如果 SDK 未安装或配置不完整，会记录错误日志并返回。
+        """
         if not QQ_AVAILABLE:
             logger.error("QQ SDK not installed. Run: pip install qq-botpy")
             return
@@ -81,7 +179,12 @@ class QQChannel(BaseChannel):
         await self._run_bot()
 
     async def _run_bot(self) -> None:
-        """Run the bot connection with auto-reconnect."""
+        """
+        运行机器人连接，支持自动重连。
+
+        当连接断开时，等待 5 秒后尝试重新连接。
+        此循环会持续运行，直到 _running 标志被设置为 False。
+        """
         while self._running:
             try:
                 await self._client.start(appid=self.config.app_id, secret=self.config.secret)
@@ -92,7 +195,7 @@ class QQChannel(BaseChannel):
                 await asyncio.sleep(5)
 
     async def stop(self) -> None:
-        """Stop the QQ bot."""
+        """停止 QQ 机器人，关闭客户端连接。"""
         self._running = False
         if self._client:
             try:
@@ -102,7 +205,16 @@ class QQChannel(BaseChannel):
         logger.info("QQ bot stopped")
 
     async def send(self, msg: OutboundMessage) -> None:
-        """Send a message through QQ."""
+        """
+        通过 QQ 发送消息。
+
+        根据聊天类型（单聊或群聊）调用相应的 API：
+        - 群聊：post_group_message
+        - 单聊：post_c2c_message
+
+        Args:
+            msg: 出站消息对象，包含 chat_id、content 和 metadata
+        """
         if not self._client:
             logger.warning("QQ client not initialized")
             return
@@ -131,9 +243,19 @@ class QQChannel(BaseChannel):
             logger.error("Error sending QQ message: {}", e)
 
     async def _on_message(self, data: "C2CMessage | GroupMessage", is_group: bool = False) -> None:
-        """Handle incoming message from QQ."""
+        """
+        处理来自 QQ 的入站消息。
+
+        1. 消息去重（基于 message ID）
+        2. 提取发送者 ID 和聊天 ID
+        3. 将消息发布到消息总线
+
+        Args:
+            data: botpy 消息对象（C2CMessage 或 GroupMessage）
+            is_group: 是否为群聊消息
+        """
         try:
-            # Dedup by message ID
+            # 基于消息 ID 去重
             if data.id in self._processed_ids:
                 return
             self._processed_ids.append(data.id)

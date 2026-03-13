@@ -1,4 +1,79 @@
+# =============================================================================
+# nanobot Matrix (Element) 渠道
+# 文件路径：nanobot/channels/matrix.py
+#
+# 这个文件的作用是什么？
+# -------------------------
+# 这个文件实现了 MatrixChannel 类，让 nanobot 能够通过 Matrix 协议与用户交互。
+#
+# 什么是 MatrixChannel？
+# --------------------
+# MatrixChannel 是 nanobot 与 Matrix 网络的"适配器"：
+# 1. 使用 nio 异步 SDK 连接 Matrix 服务器
+# 2. 支持端到端加密（E2EE）
+# 3. 支持长轮询同步接收消息
+# 4. 支持媒体文件上传下载
+# 5. 支持 Markdown 转 HTML 格式化
+#
+# 为什么需要 Matrix 渠道？
+# ----------------------
+# 1. 去中心化：Matrix 是开放的去中心化通信协议
+# 2. 数据主权：可自建服务器，完全控制数据
+# 3. 端到端加密：原生支持 E2EE，保障隐私
+# 4. 跨平台互通：可与 Element、FluffyChat 等客户端互通
+# 5. 企业私有部署：适合对数据隐私要求高的场景
+#
+# 工作原理：
+# ---------
+# 入站（接收消息）：
+# 1. 使用 AsyncClient 建立与 homeserver 的连接
+# 2. 启动 sync_forever 长轮询循环
+# 3. 监听 RoomMessageText（文本消息）
+# 4. 监听 RoomMessageMedia/RoomEncryptedMedia（媒体消息）
+# 5. 监听 InviteEvent（房间邀请，自动加入）
+# 6. 下载并解密媒体附件（如启用 E2EE）
+# 7. 发送 typing 指示器
+# 8. 将消息发布到消息总线
+#
+# 出站（发送消息）：
+# 1. 从消息总线获取 OutboundMessage
+# 2. 将 Markdown 转换为 HTML（使用 mistune）
+# 3. 使用 nh3 清理 HTML（安全过滤）
+# 4. 调用 room_send 发送消息
+# 5. 上传媒体文件并发送
+# 6. 支持线程回复（m.thread）
+#
+# 配置示例：
+# --------
+# {
+#   "channels": {
+#     "matrix": {
+#       "enabled": true,
+#       "homeserver": "https://matrix.org",
+#       "userId": "@nanobot:matrix.org",
+#       "accessToken": "your-access-token",
+#       "deviceId": "nanobot-device",
+#       "e2eeEnabled": true,
+#       "groupPolicy": "mention",
+#       "maxMediaBytes": 10485760
+#     }
+#   }
+# }
+#
+# 依赖安装：
+# --------
+# pip install nanobot-ai[matrix]
+#
+# 注意事项：
+# --------
+# 1. 需要 Matrix 账户和 access token
+# 2. E2EE 需要正确配置 device ID 和 store path
+# 3. 媒体文件存储在本地的 media/matrix 目录
+# 4. 支持的政策模式：open、mention、allowlist
+# =============================================================================
+
 """Matrix (Element) channel — inbound sync + outbound message/media delivery."""
+# Matrix（Element）渠道：入站同步 + 出站消息/媒体投递
 
 import asyncio
 import logging
@@ -42,40 +117,59 @@ from nanobot.channels.base import BaseChannel
 from nanobot.config.paths import get_data_dir, get_media_dir
 from nanobot.utils.helpers import safe_filename
 
+# Typing 指示器超时时间（毫秒）
 TYPING_NOTICE_TIMEOUT_MS = 30_000
-# Must stay below TYPING_NOTICE_TIMEOUT_MS so the indicator doesn't expire mid-processing.
+# 必须低于 TYPING_NOTICE_TIMEOUT_MS，防止指示器在处理过程中过期
 TYPING_KEEPALIVE_INTERVAL_MS = 20_000
+# Matrix HTML 格式标识符
 MATRIX_HTML_FORMAT = "org.matrix.custom.html"
+# 附件标记占位符
 _ATTACH_MARKER = "[attachment: {}]"
 _ATTACH_TOO_LARGE = "[attachment: {} - too large]"
 _ATTACH_FAILED = "[attachment: {} - download failed]"
 _ATTACH_UPLOAD_FAILED = "[attachment: {} - upload failed]"
 _DEFAULT_ATTACH_NAME = "attachment"
+# 消息类型映射
 _MSGTYPE_MAP = {"m.image": "image", "m.audio": "audio", "m.video": "video", "m.file": "file"}
 
+# Matrix 媒体事件类型过滤器
 MATRIX_MEDIA_EVENT_FILTER = (RoomMessageMedia, RoomEncryptedMedia)
 MatrixMediaEvent: TypeAlias = RoomMessageMedia | RoomEncryptedMedia
 
+# 创建 Markdown 渲染器，支持表格、删除线、链接等插件
 MATRIX_MARKDOWN = create_markdown(
     escape=True,
     plugins=["table", "strikethrough", "url", "superscript", "subscript"],
 )
 
+# Matrix 允许的 HTML 标签白名单
 MATRIX_ALLOWED_HTML_TAGS = {
     "p", "a", "strong", "em", "del", "code", "pre", "blockquote",
     "ul", "ol", "li", "h1", "h2", "h3", "h4", "h5", "h6",
     "hr", "br", "table", "thead", "tbody", "tr", "th", "td",
     "caption", "sup", "sub", "img",
 }
+# Matrix 允许的 HTML 属性白名单
 MATRIX_ALLOWED_HTML_ATTRIBUTES: dict[str, set[str]] = {
     "a": {"href"}, "code": {"class"}, "ol": {"start"},
     "img": {"src", "alt", "title", "width", "height"},
 }
+# Matrix 允许的 URL 协议白名单
 MATRIX_ALLOWED_URL_SCHEMES = {"https", "http", "matrix", "mailto", "mxc"}
 
 
 def _filter_matrix_html_attribute(tag: str, attr: str, value: str) -> str | None:
-    """Filter attribute values to a safe Matrix-compatible subset."""
+    """
+    过滤属性值为 Matrix 兼容的安全子集。
+
+    Args:
+        tag: HTML 标签名
+        attr: 属性名
+        value: 属性值
+
+    Returns:
+        过滤后的属性值，或 None 表示移除该属性
+    """
     if tag == "a" and attr == "href":
         return value if value.lower().startswith(("https://", "http://", "matrix:", "mailto:")) else None
     if tag == "img" and attr == "src":
@@ -86,6 +180,7 @@ def _filter_matrix_html_attribute(tag: str, attr: str, value: str) -> str | None
     return value
 
 
+# Matrix HTML 清理器，使用 nh3 进行安全过滤
 MATRIX_HTML_CLEANER = nh3.Cleaner(
     tags=MATRIX_ALLOWED_HTML_TAGS,
     attributes=MATRIX_ALLOWED_HTML_ATTRIBUTES,
@@ -97,14 +192,22 @@ MATRIX_HTML_CLEANER = nh3.Cleaner(
 
 
 def _render_markdown_html(text: str) -> str | None:
-    """Render markdown to sanitized HTML; returns None for plain text."""
+    """
+    将 Markdown 渲染为经过 sanitization 的 HTML；纯文本返回 None。
+
+    Args:
+        text: Markdown 格式文本
+
+    Returns:
+        清理后的 HTML 字符串，或 None 表示不需要格式化
+    """
     try:
         formatted = MATRIX_HTML_CLEANER.clean(MATRIX_MARKDOWN(text)).strip()
     except Exception:
         return None
     if not formatted:
         return None
-    # Skip formatted_body for plain <p>text</p> to keep payload minimal.
+    # 为保持负载最小，纯 <p>text</p> 跳过 formatted_body
     if formatted.startswith("<p>") and formatted.endswith("</p>"):
         inner = formatted[3:-4]
         if "<" not in inner and ">" not in inner:
@@ -113,7 +216,15 @@ def _render_markdown_html(text: str) -> str | None:
 
 
 def _build_matrix_text_content(text: str) -> dict[str, object]:
-    """Build Matrix m.text payload with optional HTML formatted_body."""
+    """
+    构建 Matrix m.text 消息负载，包含可选的 HTML formatted_body。
+
+    Args:
+        text: 消息文本
+
+    Returns:
+        Matrix 消息内容字典
+    """
     content: dict[str, object] = {"msgtype": "m.text", "body": text, "m.mentions": {}}
     if html := _render_markdown_html(text):
         content["format"] = MATRIX_HTML_FORMAT
@@ -122,7 +233,12 @@ def _build_matrix_text_content(text: str) -> dict[str, object]:
 
 
 class _NioLoguruHandler(logging.Handler):
-    """Route matrix-nio stdlib logs into Loguru."""
+    """
+    将 matrix-nio 的 stdlib 日志路由到 Loguru。
+
+    此处理器捕获 nio 库的日志记录，并将其重定向到 Loguru，
+    以保持日志输出的一致性。
+    """
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
@@ -136,7 +252,11 @@ class _NioLoguruHandler(logging.Handler):
 
 
 def _configure_nio_logging_bridge() -> None:
-    """Bridge matrix-nio logs to Loguru (idempotent)."""
+    """
+    桥接 matrix-nio 日志到 Loguru（幂等操作）。
+
+    如果尚未配置，则添加 _NioLoguruHandler 到 nio  logger。
+    """
     nio_logger = logging.getLogger("nio")
     if not any(isinstance(h, _NioLoguruHandler) for h in nio_logger.handlers):
         nio_logger.handlers = [_NioLoguruHandler()]
@@ -144,12 +264,36 @@ def _configure_nio_logging_bridge() -> None:
 
 
 class MatrixChannel(BaseChannel):
-    """Matrix (Element) channel using long-polling sync."""
+    """
+    使用长轮询同步的 Matrix（Element）渠道。
+
+    支持的功能：
+    - 文本消息（支持 Markdown 转 HTML）
+    - 媒体消息（图片、音频、视频、文件）
+    - 端到端加密（E2EE）
+    - 线程回复（m.thread）
+    - Typing 指示器
+    - 自动加入房间邀请
+    - 群聊政策控制（open、mention、allowlist）
+
+    安全特性：
+    - HTML 标签白名单过滤（使用 nh3）
+    - URL 协议白名单检查
+    - 工作空间路径限制（防止任意文件上传）
+    - 媒体大小限制
+    """
 
     name = "matrix"
     display_name = "Matrix"
 
     def __init__(self, config: Any, bus: MessageBus):
+        """
+        初始化 Matrix 渠道。
+
+        Args:
+            config: Matrix 配置对象（包含 homeserver、user_id、access_token 等）
+            bus: 消息总线实例
+        """
         super().__init__(config, bus)
         self.client: AsyncClient | None = None
         self._sync_task: asyncio.Task | None = None
@@ -160,7 +304,17 @@ class MatrixChannel(BaseChannel):
         self._server_upload_limit_checked = False
 
     async def start(self) -> None:
-        """Start Matrix client and begin sync loop."""
+        """
+        启动 Matrix 客户端并开始同步循环。
+
+        启动流程：
+        1. 配置 nio 日志桥接到 Loguru
+        2. 创建数据存储目录（用于 E2EE 状态）
+        3. 创建 AsyncClient 实例
+        4. 注册事件回调和处理函数
+        5. 加载 E2EE 状态（如果启用）
+        6. 启动同步任务
+        """
         self._running = True
         _configure_nio_logging_bridge()
 
@@ -193,7 +347,15 @@ class MatrixChannel(BaseChannel):
         self._sync_task = asyncio.create_task(self._sync_loop())
 
     async def stop(self) -> None:
-        """Stop the Matrix channel with graceful sync shutdown."""
+        """
+        停止 Matrix 渠道，优雅关闭同步。
+
+        停止流程：
+        1. 停止所有 typing 保持活跃任务
+        2. 停止客户端同步
+        3. 等待同步任务完成（带超时）
+        4. 关闭客户端连接
+        """
         self._running = False
         for room_id in list(self._typing_tasks):
             await self._stop_typing_keepalive(room_id, clear_typing=False)
